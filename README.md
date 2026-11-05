@@ -1,6 +1,6 @@
 # 3D Blu-ray ISO Repair
 
-3D Blu-ray ISO Repair analyses and repairs UDF allocation tables in 3D Blu-ray ISO images. It finds 3D clip pairs whose `.m2ts` view files and SSIF containers no longer agree, then rewrites the affected file entries, growing the ISO when the metadata needs more room.
+3D Blu-ray ISO Repair repairs UDF allocation tables in 3D Blu-ray ISO images. It finds 3D clip pairs whose `.m2ts` view files and SSIF containers no longer agree, then rewrites the affected file entries, growing the ISO when the metadata needs more room.
 
 It repairs three related defects:
 
@@ -28,18 +28,16 @@ or manually:
 
 ```
 windres src/version.rc -O coff -o src/version_rc.o
-gcc -O2 -std=c11 -Wall -Wextra -o 3d_bluray_iso_repair_v0.1.exe \
+gcc -O2 -std=c11 -Wall -Wextra -o 3d_bluray_iso_repair.exe \
     src/udf.c src/udf_repair.c src/clpi.c src/repair.c src/report.c src/main.c src/version_rc.o
 ```
 
-On Windows the result is `3d_bluray_iso_repair_v0.1.exe`, carrying a `VERSIONINFO` resource from `src/version.rc`. `build.bat` needs `gcc` and `windres` on `PATH` (for example from w64devkit or MinGW-w64), or the `CC` and `RC` environment variables pointing to them.
-
-The version is set only in `src/version.h`; the program, the Windows resource, the exe name and both build scripts read it from there.
+On Windows the executable carries a `VERSIONINFO` resource from `src/version.rc`. `build.bat` needs `gcc` and `windres` on `PATH`, or the `CC` and `RC` environment variables pointing to them.
 
 ## Usage
 
 ```
-3d_bluray_iso_repair_v0.1.exe <input> [options]
+3d_bluray_iso_repair.exe <input> [options]
 ```
 
 Run with no arguments, `-h` or `-help` to print the built-in help.
@@ -82,8 +80,6 @@ Verifying the repaired image...
 All 3D clip pairs are consistent now.
 ```
 
-When an ISO needs to grow, it is extended in whole allocation units and the partition and metadata descriptors are updated. The rewrite is performed in place; the original size is restored by `-undo`.
-
 ### Undo
 
 An `-apply` run writes a journal next to the ISO:
@@ -92,14 +88,14 @@ An `-apply` run writes a journal next to the ISO:
 test.iso.udffix-undo
 ```
 
-It records the original image size and the original contents of every sector that is overwritten. `-undo` writes those sectors back, truncates the image to its original size, and renames the journal to `.udffix-undo.done`:
+`-undo` writes the original sectors back, truncates the image to its original size, and renames the journal to `.udffix-undo.done`:
 
 ```
-3d_bluray_iso_repair_v0.1.exe test.iso -undo
+3d_bluray_iso_repair.exe test.iso -undo
 Restored 99 sector(s). Image is back to its previous state.
 ```
 
-`-undo` accepts a single ISO file, not a folder. Keep the journal until the repaired image has been tested. An existing journal prevents a second `-apply` from overwriting it.
+Keep the journal until the repaired image has been tested. An existing journal prevents a second `-apply` from overwriting it.
 
 ### Folder mode
 
@@ -113,9 +109,9 @@ a_broken.iso      10  Fixable: SSIF extent alignment repair: 1; Stream file tabl
 
 Without `-apply`, the status is `Fixable` or `Not fixable`. With `-apply`, fixable ISOs are repaired and verified; unfixable ISOs are left untouched and reported. Clean ISOs are skipped unless `-show-all` is given.
 
-### Interleaving order and data checks
+### Interleaving order
 
-The interleaving order of base and dependent chunks is detected from MPEG-TS sync bytes in the streams. `-order` overrides the detection with `DB` or `BD`. `-no-data-check` skips the probes; this is useful when the stream data itself is known to be unreadable, but it removes the check that the chosen order matches the data on disc.
+The chunk order is detected from MPEG-TS sync bytes in the streams. `-order` forces `DB` or `BD`; `-no-data-check` skips the probes.
 
 ## Safety
 

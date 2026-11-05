@@ -12,9 +12,12 @@ static void usage_line(FILE *out) {
     fprintf(out, "       [-no-data-check] [-show-all] image\n");
 }
 
-static void help(void) {
+static void banner(void) {
     printf("3D Blu-ray ISO Repair v%s\n", BR3D_VERSION);
     printf("NTM-3D\n\n");
+}
+
+static void help(void) {
     usage_line(stdout);
     printf("\n");
     printf("Repair UDF allocation issues in 3D Blu-ray ISO images. Accepts a single .iso\n");
@@ -97,6 +100,7 @@ static int parse_args(int argc, char **argv, const char **image, Options *opt, i
 }
 
 int main(int argc, char **argv) {
+    banner();
     Options opt;
     memset(&opt, 0, sizeof(opt));
     const char *image = NULL;

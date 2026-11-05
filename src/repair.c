@@ -787,7 +787,8 @@ static char *base_name(const char *path){
 }
 
 static void print_single(const char *path,Image *img,Report *rep,Options *opt){
-    printf("\n%s (",base_name(path));
+    if(opt->chatty) printf("\n");
+    printf("%s (",base_name(path));
     char sz[64]; fmt_size(img->orig_size,sz,sizeof(sz)); printf("%s)\n",sz);
     printf("%zu clips, %zu playlists, %zu 3D clip pairs.\n",rep->clips_scanned,rep->playlists_scanned,rep->pairs_count);
 

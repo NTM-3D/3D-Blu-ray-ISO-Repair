@@ -9,7 +9,7 @@ static const char *PROG = "3d_bluray_iso_repair_v" BR3D_VERSION ".exe";
 
 static void usage_line(FILE *out) {
     fprintf(out, "usage: %s [-h] [-help] [-apply] [-undo] [-order {DB,BD}] [-chatty]\n", PROG);
-    fprintf(out, "       [-no-data-check] [-show-all] image\n");
+    fprintf(out, "       [-no-data-check] [-show-all] input\n");
 }
 
 static void banner(void) {
@@ -24,7 +24,7 @@ static void help(void) {
     printf("file or a folder of .iso files.\n");
     printf("\n");
     printf("positional arguments:\n");
-    printf("  image                 Path to a 3D Blu-ray ISO image, or a folder containing ISOs\n");
+    printf("  input                 Path to a 3D Blu-ray ISO image, or a folder containing ISOs\n");
     printf("\n");
     printf("options:\n");
     printf("  -h, -help             show this help message and exit\n");
@@ -48,8 +48,8 @@ static int is_file(const char *path) {
     return (st.st_mode & _S_IFMT) == _S_IFREG;
 }
 
-static int parse_args(int argc, char **argv, const char **image, Options *opt, int *undo) {
-    *image = NULL;
+static int parse_args(int argc, char **argv, const char **input, Options *opt, int *undo) {
+    *input = NULL;
     *undo = 0;
     if (argc == 1) {
         help();
@@ -84,16 +84,16 @@ static int parse_args(int argc, char **argv, const char **image, Options *opt, i
         } else if (a[0] == '-' && a[1] != 0) {
             fprintf(stderr, "%s: error: unrecognized arguments: %s\n", PROG, a);
             return 2;
-        } else if (*image == NULL) {
-            *image = a;
+        } else if (*input == NULL) {
+            *input = a;
         } else {
             fprintf(stderr, "%s: error: unrecognized arguments: %s\n", PROG, a);
             return 2;
         }
     }
-    if (*image == NULL) {
+    if (*input == NULL) {
         usage_line(stderr);
-        fprintf(stderr, "%s: error: the following arguments are required: image\n", PROG);
+        fprintf(stderr, "%s: error: the following arguments are required: input\n", PROG);
         return 2;
     }
     return 0;
@@ -103,9 +103,9 @@ int main(int argc, char **argv) {
     banner();
     Options opt;
     memset(&opt, 0, sizeof(opt));
-    const char *image = NULL;
+    const char *input = NULL;
     int undo = 0;
-    int pr = parse_args(argc, argv, &image, &opt, &undo);
+    int pr = parse_args(argc, argv, &input, &opt, &undo);
     if (pr != 0) return pr < 0 ? 0 : pr;
 
     ErrCtx err;
@@ -116,19 +116,19 @@ int main(int argc, char **argv) {
     }
 
     if (undo) {
-        if (is_dir(image)) {
+        if (is_dir(input)) {
             fprintf(stderr, "Error: -undo requires a single ISO file, not a folder.\n");
             return 2;
         }
-        int n = run_undo(image);
+        int n = run_undo(input);
         printf("Restored %d sector(s). Image is back to its previous state.\n", n);
         return 0;
     }
 
-    if (is_dir(image)) return run_folder(image, &opt);
-    if (!is_file(image)) {
-        fprintf(stderr, "Error: not a file or folder: %s\n", image);
+    if (is_dir(input)) return run_folder(input, &opt);
+    if (!is_file(input)) {
+        fprintf(stderr, "Error: not a file or folder: %s\n", input);
         return 2;
     }
-    return run_single(image, &opt);
+    return run_single(input, &opt);
 }

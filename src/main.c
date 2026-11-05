@@ -14,6 +14,7 @@ static void usage_line(FILE *out) {
 
 static void help(void) {
     printf("3D Blu-ray ISO Repair v%s\n", BR3D_VERSION);
+    printf("NTM-3D\n\n");
     usage_line(stdout);
     printf("\n");
     printf("Repair UDF allocation issues in 3D Blu-ray ISO images. Accepts a single .iso\n");
@@ -47,6 +48,10 @@ static int is_file(const char *path) {
 static int parse_args(int argc, char **argv, const char **image, Options *opt, int *undo) {
     *image = NULL;
     *undo = 0;
+    if (argc == 1) {
+        help();
+        return -1;
+    }
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (strcmp(a, "-h") == 0 || strcmp(a, "-help") == 0) {

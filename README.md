@@ -42,7 +42,7 @@ The version is set only in `src/version.h`; the program, the Windows resource, t
 3d_bluray_iso_repair_v0.1.exe <iso-or-folder> [options]
 ```
 
-Run with `-h` or `-help` to print the built-in help.
+Run with no arguments, `-h` or `-help` to print the built-in help.
 
 ### Options
 

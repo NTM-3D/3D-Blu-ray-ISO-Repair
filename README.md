@@ -8,6 +8,17 @@ It repairs three related defects:
 - SSIF extents that cut through interleaved chunks
 - `.m2ts` view files that point at standalone data instead of the interleaved SSIF data
 
+## Playback problems this fixes
+
+When the allocation tables disagree, the player reads the wrong data from the interleaved base and dependent streams. Depending on the player, the same defect can show up as:
+
+- The picture freezing at a point and never recovering.
+- Stuttering or dropped frames during playback.
+- The player skipping ahead, jumping over scenes or to the end of the movie.
+- Playback failing completely, with the player returning to the menu or showing an error.
+
+The video data itself is usually intact; the problem is in the ISO's file system metadata. Once the `.m2ts` and SSIF allocations agree again, the image can play normally on players and virtual drives that previously failed.
+
 Analysis is read-only by default. Nothing is written to the ISO until `-apply` is given.
 
 ## Building

@@ -3,30 +3,35 @@
 #include <string.h>
 
 static void *xm(size_t n){ void*p=malloc(n?n:1); if(!p) udf_error("Out of memory."); return p; }
+static void *xr(void *p, size_t n){ void*q=realloc(p,n?n:1); if(!q) udf_error("Out of memory."); return q; }
 
 Clpi parse_clpi(const unsigned char *data, size_t len) {
     Clpi c; memset(&c,0,sizeof(c));
     if (len < 60 || memcmp(data,"HDMV",4)!=0) return c;
     c.pkts = b32(data,56);
     uint32_t ext = b32(data,24);
-    if (ext && ext + 12 <= len) {
-        for (size_t i=0;i<data[ext+11];i++) {
-            size_t e = ext + 12 + 12*i;
-            if (e+12 > len) break;
+    if (ext) {
+        if ((size_t)ext + 12 > len) goto bad;
+        unsigned nent = data[ext+11];
+        for (unsigned i=0;i<nent;i++) {
+            size_t e = (size_t)ext + 12 + 12*(size_t)i;
+            if (e + 12 > len) goto bad;
             if (b16(data,e)==2 && b16(data,e+2)==4) {
-                uint32_t q = ext + b32(data,e+4);
-                if (q+8 > len) break;
+                size_t q = (size_t)ext + b32(data,e+4);
+                if (q + 8 > len) goto bad;
                 uint32_t cnt = b32(data,q+4);
-                c.sp = xm(cnt*sizeof(uint32_t));
+                if ((uint64_t)cnt * 4 > (uint64_t)(len - q - 8)) goto bad;
+                free(c.sp);
+                c.sp = xm((cnt?cnt:1)*sizeof(uint32_t));
                 c.sp_count = cnt;
-                for (uint32_t k=0;k<cnt;k++) {
-                    if (q+8+4*k+4 > len) break;
-                    c.sp[k] = b32(data, q+8+4*k);
-                }
+                for (uint32_t k=0;k<cnt;k++) c.sp[k] = b32(data, q + 8 + 4*(size_t)k);
             }
         }
     }
     c.valid = 1;
+    return c;
+bad:
+    free(c.sp); memset(&c,0,sizeof(c));
     return c;
 }
 
@@ -38,58 +43,64 @@ MplsPairs parse_mpls_pairs(const unsigned char *data, size_t len) {
     /* parse items */
     size_t item_count = 0;
     char **items = NULL;
-    if (pl + 8 <= len) {
-        item_count = b16(data, pl+6);
-        items = xm(item_count*sizeof(char*));
-        size_t pos = pl + 10;
-        for (size_t i=0;i<item_count;i++) {
-            items[i] = xm(6);
-            memset(items[i],0,6);
-            if (pos+7 <= len) memcpy(items[i], data+pos+2, 5);
-            if (pos+2 <= len) pos += 2 + b16(data,pos);
-            else break;
-        }
+    if ((size_t)pl + 8 > len) goto bad;
+    item_count = b16(data, pl+6);
+    items = xm((item_count?item_count:1)*sizeof(char*));
+    memset(items,0,item_count*sizeof(char*));
+    size_t pos = (size_t)pl + 10;
+    for (size_t i=0;i<item_count;i++) {
+        items[i] = xm(6);
+        memset(items[i],0,6);
+        if (pos + 7 > len) goto bad;
+        memcpy(items[i], data+pos+2, 5);
+        pos += 2 + (size_t)b16(data,pos);
+    }
+    if (!ext) {
+        for (size_t i=0;i<item_count;i++) free(items[i]);
+        free(items);
+        return p;
     }
     /* parse ext */
-    if (ext && ext+12 <= len) {
-        for (size_t i=0;i<data[ext+11];i++) {
-            size_t e = ext + 12 + 12*i;
-            if (e+12 > len) break;
-            if (b16(data,e)!=2 || b16(data,e+2)!=2) continue;
-            uint32_t q = ext + b32(data,e+4);
-            if (q+6 > len) continue;
-            uint16_t nsub = b16(data,q+4);
-            q += 6;
-            for (size_t s=0;s<nsub;s++) {
-                if (q+10 > len) break;
-                uint32_t sl = b32(data,q);
-                unsigned char stype = data[q+5];
-                unsigned char nspi = data[q+9];
-                size_t r = q + 10;
-                for (size_t t=0;t<nspi;t++) {
-                    if (r+26 > len) break;
-                    char dep[6]; memset(dep,0,6); memcpy(dep, data+r+2, 5);
-                    uint16_t sync = b16(data,r+24);
-                    if ((stype==8 || stype==9) && item_count>0) {
-                        /* add pair */
-                        size_t base_idx = (sync < item_count) ? sync : 0;
-                        /* append */
-                        p.count++;
-                        p.bases = realloc(p.bases, p.count*sizeof(char*));
-                        p.deps = realloc(p.deps, p.count*sizeof(char*));
-                        p.bases[p.count-1] = xm(6); memset(p.bases[p.count-1],0,6); strcpy(p.bases[p.count-1], items[base_idx]);
-                        p.deps[p.count-1] = xm(6); memset(p.deps[p.count-1],0,6); strcpy(p.deps[p.count-1], dep);
-                    }
-                    if (r+2 <= len) r += 2 + b16(data,r);
-                    else break;
+    if ((size_t)ext + 12 > len) goto bad;
+    for (size_t i=0;i<data[ext+11];i++) {
+        size_t e = (size_t)ext + 12 + 12*i;
+        if (e+12 > len) goto bad;
+        if (b16(data,e)!=2 || b16(data,e+2)!=2) continue;
+        size_t q = (size_t)ext + b32(data,e+4);
+        if (q+6 > len) goto bad;
+        uint16_t nsub = b16(data,q+4);
+        q += 6;
+        for (size_t s=0;s<nsub;s++) {
+            if (q+10 > len) goto bad;
+            uint32_t sl = b32(data,q);
+            unsigned char stype = data[q+5];
+            unsigned char nspi = data[q+9];
+            size_t r = q + 10;
+            for (size_t t=0;t<nspi;t++) {
+                if (r+26 > len) goto bad;
+                char dep[6]; memset(dep,0,6); memcpy(dep, data+r+2, 5);
+                uint16_t sync = b16(data,r+24);
+                if ((stype==8 || stype==9) && item_count>0) {
+                    /* add pair */
+                    size_t base_idx = (sync < item_count) ? sync : 0;
+                    p.count++;
+                    p.bases = xr(p.bases, p.count*sizeof(char*));
+                    p.deps = xr(p.deps, p.count*sizeof(char*));
+                    p.bases[p.count-1] = xm(6); memset(p.bases[p.count-1],0,6); strcpy(p.bases[p.count-1], items[base_idx]);
+                    p.deps[p.count-1] = xm(6); memset(p.deps[p.count-1],0,6); strcpy(p.deps[p.count-1], dep);
                 }
-                q += 4 + sl;
+                r += 2 + (size_t)b16(data,r);
             }
+            q += 4 + (size_t)sl;
         }
     }
-    /* free items */
     for (size_t i=0;i<item_count;i++) free(items[i]);
     free(items);
+    return p;
+bad:
+    for (size_t i=0;i<item_count;i++) free(items[i]);
+    free(items);
+    mpls_pairs_free(&p);
     return p;
 }
 

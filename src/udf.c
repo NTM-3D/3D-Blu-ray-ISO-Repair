@@ -187,13 +187,19 @@ int image_apply(Image *img) {
         fwrite(old,1,BS,j);
         free(old);
     }
-    fflush(j); /* fsync not available easily */ fclose(j);
+    if (fflush(j) != 0 || _commit(_fileno(j)) != 0) {
+        fclose(j);
+        udf_error("Cannot flush undo journal to disk.");
+    }
+    fclose(j);
     /* write pending */
     for (size_t i=0;i<img->pending_count;i++) {
         _fseeki64(img->f, (long long)(img->pending[i].sec*BS), SEEK_SET);
         fwrite(img->pending[i].data,1,BS,img->f);
     }
-    fflush(img->f);
+    if (fflush(img->f) != 0 || _commit(_fileno(img->f)) != 0) {
+        udf_error("Cannot flush repaired image to disk.");
+    }
     int n = (int)img->pending_count;
     img->pending_count = 0;
     return n;
@@ -207,8 +213,18 @@ int image_undo(const char *path) {
     char magic[8];
     if (fread(magic,1,8,j)!=8 || memcmp(magic,JOURNAL_MAGIC,8)!=0) { fclose(j); udf_error("Journal has invalid magic signature."); }
     uint64_t orig_size; uint32_t n;
-    fread(&orig_size,1,8,j);
-    fread(&n,1,4,j);
+    if (fread(&orig_size,1,8,j)!=8 || fread(&n,1,4,j)!=4) {
+        fclose(j);
+        udf_error("Journal is truncated.");
+    }
+    long long jpos = _ftelli64(j);
+    _fseeki64(j, 0, SEEK_END);
+    long long jend = _ftelli64(j);
+    _fseeki64(j, jpos, SEEK_SET);
+    if (jend < jpos || (uint64_t)n > (uint64_t)(jend-jpos)/(8+BS)) {
+        fclose(j);
+        udf_error("Journal is truncated.");
+    }
     /* read records */
     typedef struct { uint64_t sec; unsigned char data[BS]; } Rec;
     Rec *recs = xmalloc((size_t)n*sizeof(Rec));
@@ -225,14 +241,19 @@ int image_undo(const char *path) {
             fwrite(recs[i].data,1,BS,f);
         }
     }
-    _chsize_s(_fileno(f), (long long)orig_size);
-    fflush(f); fclose(f);
+    if (fflush(f) != 0) { fclose(f); udf_error("Cannot flush restored image to disk."); }
+    if (_chsize_s(_fileno(f), (long long)orig_size) != 0) { fclose(f); udf_error("Cannot restore image size."); }
+    if (_commit(_fileno(f)) != 0) { fclose(f); udf_error("Cannot flush restored image to disk."); }
+    fclose(f);
     free(recs);
     /* rename journal to .done */
     char done[4096];
     snprintf(done, sizeof(done), "%s.udffix-undo.done", path);
     remove(done);
-    rename(jpath, done);
+    if (rename(jpath, done) != 0) {
+        /* Python falls back to deleting the journal when the rename fails. */
+        remove(jpath);
+    }
     return (int)n;
 }
 
@@ -296,7 +317,10 @@ Udf *udf_create(Image *img) {
         }
         if (tid!=6) free(b);
     }
-    if (!lvd) udf_error("LVD not found.");
+    if (!lvd) udf_error("Volume descriptor sequence incomplete.");
+    int any_pd = 0;
+    for (int pi=0; pi<16; pi++) if (u->pd_valid[pi]) any_pd = 1;
+    if (!any_pd) udf_error("Volume descriptor sequence incomplete.");
     /* reserve VDS */
     uint32_t rlen = u32(avdp,24);
     uint32_t rloc = u32(avdp,28);
@@ -319,6 +343,7 @@ Udf *udf_create(Image *img) {
     u->maps_count=0;
     size_t off = 440;
     for (int mi=0; mi<nmaps; mi++) {
+        if (off + 52 > BS) udf_error("Unsupported partition map (type %d).", (off < BS) ? lvd[off] : 0);
         int t = lvd[off];
         int l = lvd[off+1];
         if (t==1) {
@@ -338,8 +363,9 @@ Udf *udf_create(Image *img) {
             m->has_mirror_ext=0;
             m->phys_ref=-1;
         } else {
-            udf_error("Unsupported partition map.");
+            udf_error("Unsupported partition map (type %d).", t);
         }
+        if (l <= 0) udf_error("Unsupported partition map (type %d).", t);
         off += l;
     }
     free(avdp);
@@ -352,7 +378,7 @@ Udf *udf_create(Image *img) {
         for (size_t j=0;j<u->maps_count;j++) {
             if (u->maps[j].kind==0 && u->maps[j].part==m->part) { pref=(int)j; break; }
         }
-        if (pref<0) udf_error("Metadata partition refers to unknown partition.");
+        if (pref<0) udf_error("Metadata partition refers to unknown partition %d.", m->part);
         m->phys_ref=pref;
         /* load meta file node */
         /* need udf_load, but udf_load uses u. We'll implement load after. For now store meta lbn; load later? */
@@ -404,7 +430,7 @@ uint64_t udf_sector_of(Udf *u, int ref, uint32_t lbn, int mirror) {
         }
         off -= ext->nb[i];
     }
-    udf_error("Metadata block outside partition.");
+    udf_error("Metadata block %u is outside the metadata partition.", lbn);
     return 0;
 }
 
@@ -439,7 +465,7 @@ static void udf_setup_meta(Udf *u) {
         if (m->kind!=1) continue;
         int pref=-1;
         for (size_t j=0;j<u->maps_count;j++) if (u->maps[j].kind==0 && u->maps[j].part==m->part) { pref=(int)j; break; }
-        if (pref<0) udf_error("Metadata partition refers to unknown partition.");
+        if (pref<0) udf_error("Metadata partition refers to unknown partition %d.", m->part);
         m->phys_ref=pref;
         /* load meta node */
         /* temporarily set name */
@@ -581,17 +607,13 @@ static void *xm(size_t n){ void*p=malloc(n?n:1); if(!p) udf_error("OOM"); return
 
 unsigned char *udf_read_file(Udf *u, Node *n, size_t *out_len) {
     if (n->alloc==3) {
+        /* Python returns data[:n.info]; data is the embedded allocation bytes. */
         size_t len = n->lad;
-        unsigned char *d = xm(len?len:1);
-        memcpy(d, n->adbytes, len);
-        *out_len = n->info < len ? n->info : len;
-        /* Embedded data: return exactly the recorded file length. */
-        unsigned char *out = xm(n->info?n->info:1);
-        /* For embedded, adbytes contains data; copy info bytes */
-        if (n->info <= len) memcpy(out, n->adbytes, n->info);
-        else { memcpy(out, n->adbytes, len); memset(out+len,0,n->info-len); }
-        *out_len = (size_t)n->info;
-        free(d);
+        size_t info = (size_t)n->info;
+        size_t outlen = info < len ? info : len;
+        unsigned char *out = xm(outlen?outlen:1);
+        if (outlen) memcpy(out, n->adbytes, outlen);
+        *out_len = outlen;
         return out;
     }
     /* recorded extents */
@@ -619,12 +641,38 @@ unsigned char *udf_read_file(Udf *u, Node *n, size_t *out_len) {
         pos += nb*BS;
     }
     size_t info = (size_t)n->info;
-    unsigned char *out = xm(info?info:1);
-    if (info <= raw_len) memcpy(out, raw, info);
-    else { memcpy(out, raw, raw_len); memset(out+raw_len,0,info-raw_len); }
+    size_t outlen = info < raw_len ? info : raw_len;
+    unsigned char *out = xm(outlen?outlen:1);
+    if (outlen) memcpy(out, raw, outlen);
     free(raw);
-    *out_len = info;
+    *out_len = outlen;
     return out;
+}
+
+static size_t utf8_put(char *dst, size_t cap, uint32_t cp) {
+    if (cp < 0x80) {
+        if (cap < 1) return 0;
+        dst[0]=(char)cp; return 1;
+    }
+    if (cp < 0x800) {
+        if (cap < 2) return 0;
+        dst[0]=(char)(0xC0|(cp>>6));
+        dst[1]=(char)(0x80|(cp&0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        if (cap < 3) return 0;
+        dst[0]=(char)(0xE0|(cp>>12));
+        dst[1]=(char)(0x80|((cp>>6)&0x3F));
+        dst[2]=(char)(0x80|(cp&0x3F));
+        return 3;
+    }
+    if (cap < 4) return 0;
+    dst[0]=(char)(0xF0|(cp>>18));
+    dst[1]=(char)(0x80|((cp>>12)&0x3F));
+    dst[2]=(char)(0x80|((cp>>6)&0x3F));
+    dst[3]=(char)(0x80|(cp&0x3F));
+    return 4;
 }
 
 DirList udf_listdir(Udf *u, Node *dir) {
@@ -637,6 +685,7 @@ DirList udf_listdir(Udf *u, Node *dir) {
         unsigned char chars = data[o+18];
         unsigned char lfi = data[o+19];
         uint16_t liu = u16(data+o,36);
+        if (o + 38 + (size_t)liu + (size_t)lfi > len) break;
         uint32_t ln = (38 + liu + lfi + 3) & ~3u;
         if (!(chars & 0x0C) && lfi) {
             /* name */
@@ -647,9 +696,25 @@ DirList udf_listdir(Udf *u, Node *dir) {
                 if (nn >= sizeof(name)) nn=sizeof(name)-1;
                 memcpy(name, raw+1, nn);
             } else if (raw[0]==16) {
-                /* utf-16-be -> latin-ish; store raw bytes? We'll just copy high bytes? For filenames ASCII mostly */
+                /* utf-16-be, matching Python's decode('utf-16-be', 'replace') */
                 size_t nn=0;
-                for (size_t i=1;i<lfi && nn<sizeof(name)-1;i+=2) name[nn++] = raw[i+1];
+                for (size_t i=1;i<lfi;) {
+                    uint32_t cp;
+                    if (i+1 >= lfi) { cp=0xFFFD; i+=1; }
+                    else {
+                        cp=((uint32_t)raw[i]<<8)|raw[i+1]; i+=2;
+                        if (cp>=0xD800 && cp<=0xDBFF && i+1<lfi) {
+                            uint32_t lo=((uint32_t)raw[i]<<8)|raw[i+1];
+                            if (lo>=0xDC00 && lo<=0xDFFF) {
+                                cp=0x10000+((cp-0xD800)<<10)+(lo-0xDC00);
+                                i+=2;
+                            } else cp=0xFFFD;
+                        } else if (cp>=0xD800 && cp<=0xDFFF) cp=0xFFFD;
+                    }
+                    size_t got=utf8_put(name+nn,sizeof(name)-1-nn,cp);
+                    if (!got) break;
+                    nn+=got;
+                }
             }
             /* add entry */
             if (dl.count==dl.cap) { dl.cap=dl.cap?dl.cap*2:64; dl.items=realloc(dl.items,dl.cap*sizeof(DirEntry)); if(!dl.items) udf_error("OOM"); }
@@ -702,7 +767,7 @@ static Node *load_node(Udf *u, int ref, uint32_t lbn, const char *name) {
     memcpy(n->buf, buf, BS);
     free(buf);
     n->tag = tag_id(n->buf);
-    if (n->tag != 261 && n->tag != 266) udf_error("%s: ICB not file entry (tag %d).", name?name:"?", n->tag);
+    if (n->tag != 261 && n->tag != 266) udf_error("%s: ICB at partition %d block %u is not a file entry (tag %d).", (name && name[0])?name:"?", ref, lbn, n->tag);
     n->hdr = (n->tag==261)?176:216;
     n->ea = u32(n->buf, (n->tag==261)?168:208);
     n->lad = u32(n->buf, (n->tag==261)?172:212);
@@ -722,7 +787,8 @@ static Node *load_node(Udf *u, int ref, uint32_t lbn, const char *name) {
         unsigned char *cur = n->adbytes;
         size_t curlen = n->adbytes_len;
         int guard=0;
-        while (guard++ < 100000) {
+        for (;;) {
+            if (guard++ >= 100000) udf_error("%s: Allocation chain too long.", n->name);
             int size = (n->alloc==0)?8:16;
             int cont_found=0;
             Ad cont; memset(&cont,0,sizeof(cont));

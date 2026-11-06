@@ -15,6 +15,7 @@ static void usage_line(FILE *out) {
 static void banner(void) {
     printf("3D Blu-ray ISO Repair v%s\n", BR3D_VERSION);
     printf("NTM-3D\n\n");
+    fflush(stdout);
 }
 
 static void help(void) {
@@ -72,21 +73,25 @@ static int parse_args(int argc, char **argv, const char **input, Options *opt, i
             opt->show_all = 1;
         } else if (strcmp(a, "-order") == 0) {
             if (i + 1 >= argc) {
+                usage_line(stderr);
                 fprintf(stderr, "%s: error: argument -order: expected one argument\n", PROG);
                 return 2;
             }
             const char *v = argv[++i];
             if (strcmp(v, "DB") != 0 && strcmp(v, "BD") != 0) {
+                usage_line(stderr);
                 fprintf(stderr, "%s: error: argument -order: invalid choice: '%s' (choose from 'DB', 'BD')\n", PROG, v);
                 return 2;
             }
             strcpy(opt->order, v);
         } else if (a[0] == '-' && a[1] != 0) {
+            usage_line(stderr);
             fprintf(stderr, "%s: error: unrecognized arguments: %s\n", PROG, a);
             return 2;
         } else if (*input == NULL) {
             *input = a;
         } else {
+            usage_line(stderr);
             fprintf(stderr, "%s: error: unrecognized arguments: %s\n", PROG, a);
             return 2;
         }

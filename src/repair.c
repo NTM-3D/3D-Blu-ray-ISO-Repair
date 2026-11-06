@@ -128,7 +128,7 @@ typedef struct { char *keys; int *idxs; uint64_t *sizes; size_t count; } Layout;
 
 static void layout_free(Layout *l){ free(l->keys); free(l->idxs); free(l->sizes); memset(l,0,sizeof(*l)); }
 
-static void interleave_layout(const int *cB,int nB,const int *cD,int nD,const char *order,Layout *out){
+static void interleave_layout(const uint64_t *cB,int nB,const uint64_t *cD,int nD,const char *order,Layout *out){
     memset(out,0,sizeof(*out));
     if(nB<=0||nD<=0) udf_error("Empty CLPI interleaving table.");
     int paired=(nB<nD)?nB:nD;
@@ -170,7 +170,7 @@ static void chunkset_free(ChunkSet *s){
 }
 
 /* Layout order puts B and D chunks into alternating lists. */
-static void build_per_chunk(Extent *exS,size_t exS_count,const int *cB,int nB,const int *cD,int nD,const char *order,ChunkSet *out){
+static void build_per_chunk(Extent *exS,size_t exS_count,const uint64_t *cB,int nB,const uint64_t *cD,int nD,const char *order,ChunkSet *out){
     memset(out,0,sizeof(*out));
     Layout l; interleave_layout(cB,nB,cD,nD,order,&l);
     uint64_t pos=0;
@@ -182,7 +182,7 @@ static void build_per_chunk(Extent *exS,size_t exS_count,const int *cB,int nB,co
     layout_free(&l);
 }
 
-static int try_build_per_chunk(Extent *exS,size_t exS_count,const int *cB,int nB,const int *cD,int nD,const char *order,ChunkSet *out){
+static int try_build_per_chunk(Extent *exS,size_t exS_count,const uint64_t *cB,int nB,const uint64_t *cD,int nD,const char *order,ChunkSet *out){
     ErrCtx *saved=g_err;
     memset(out,0,sizeof(*out));
     if(!saved){ build_per_chunk(exS,exS_count,cB,nB,cD,nD,order,out); return 1; }
@@ -199,7 +199,7 @@ static void flatten_chunks(ChunkVec *v,ExtArr *out){
     for(size_t i=0;i<v->count;i++) for(size_t j=0;j<v->chunks[i].count;j++) ea_push(out,v->chunks[i].items[j]);
 }
 
-static int extents_match_ssif(Udf *u,Node *B,Node *D,Extent *exS,size_t exS_count,const int *cB,int nB,const int *cD,int nD){
+static int extents_match_ssif(Udf *u,Node *B,Node *D,Extent *exS,size_t exS_count,const uint64_t *cB,int nB,const uint64_t *cD,int nD){
     size_t ecB,ecD;
     Extent *actB=extents_of(u,B,&ecB);
     Extent *actD=extents_of(u,D,&ecD);
@@ -226,7 +226,7 @@ static int extents_match_ssif(Udf *u,Node *B,Node *D,Extent *exS,size_t exS_coun
 /* SSIF rebuilding helpers                                             */
 /* ------------------------------------------------------------------ */
 
-static ExtArr build_ssif_from_views(Extent *exB,size_t exB_count,Extent *exD,size_t exD_count,const int *cB,int nB,const int *cD,int nD,const char *order){
+static ExtArr build_ssif_from_views(Extent *exB,size_t exB_count,Extent *exD,size_t exD_count,const uint64_t *cB,int nB,const uint64_t *cD,int nD,const char *order){
     ExtArr *viewB=xm((nB?nB:1)*sizeof(ExtArr));
     ExtArr *viewD=xm((nD?nD:1)*sizeof(ExtArr));
     memset(viewB,0,(nB?nB:1)*sizeof(ExtArr));
@@ -255,7 +255,7 @@ static ExtArr build_ssif_from_views(Extent *exB,size_t exB_count,Extent *exD,siz
     return out;
 }
 
-static int ssif_alignment_ok(Extent *exS,size_t exS_count,const int *cB,int nB,const int *cD,int nD,const char *order){
+static int ssif_alignment_ok(Extent *exS,size_t exS_count,const uint64_t *cB,int nB,const uint64_t *cD,int nD,const char *order){
     Layout l; interleave_layout(cB,nB,cD,nD,order,&l);
     uint64_t *starts=xm((l.count+1)*sizeof(uint64_t));
     size_t sc=0; starts[sc++]=0;
@@ -274,7 +274,7 @@ static int ssif_alignment_ok(Extent *exS,size_t exS_count,const int *cB,int nB,c
     return !bad;
 }
 
-static int build_aligned_ssif_extents(Extent *exS,size_t exS_count,const int *cB,int nB,const int *cD,int nD,const char *order,ExtArr *out){
+static int build_aligned_ssif_extents(Extent *exS,size_t exS_count,const uint64_t *cB,int nB,const uint64_t *cD,int nD,const char *order,ExtArr *out){
     memset(out,0,sizeof(*out));
     if(!exS || !is_physically_contiguous(exS,exS_count)) return 0;
     uint64_t total=0; for(size_t i=0;i<exS_count;i++) total+=exS[i].len;
@@ -341,7 +341,7 @@ static void stem_of_name(const char *name,char *out,size_t outsize){
 /* ------------------------------------------------------------------ */
 
 static void plan_pair(Udf *u,Options *opt,Report *rep,int kind,const char *stem,const char *dstem,
-                      Node *B,Node *D,Node *S,const int *cB,int nB,const int *cD,int nD,int okB,int okD){
+                      Node *B,Node *D,Node *S,const uint64_t *cB,int nB,const uint64_t *cD,int nD,int okB,int okD){
     (void)stem; (void)dstem;
     int n=nB;
     int ref_alloc=S->alloc;
@@ -501,7 +501,7 @@ typedef struct {
     char dstem[64];
     int kind;
     Node *B,*D,*S;
-    int *cB,*cD;
+    uint64_t *cB,*cD;
     int nB,nD;
     int okB,okD;
 } Todo;
@@ -631,17 +631,13 @@ static Report *analyse_iso(Udf *udf, Options *opt) {
         Clpi *depc=clpi_find(&clpi,dbuf);
 
         size_t nB=0,nD=0;
-        uint64_t *cB64=chunk_sizes(basec,&nB);
-        uint64_t *cD64=chunk_sizes(depc,&nD);
+        uint64_t *cB=chunk_sizes(basec,&nB);
+        uint64_t *cD=chunk_sizes(depc,&nD);
         if(nB!=nD) report_say(rep,"   Asymmetric clip tables (%zu base, %zu dependent chunks).",nB,nD);
-        int *icB=xm((nB?nB:1)*sizeof(int));
-        int *icD=xm((nD?nD:1)*sizeof(int));
-        for(size_t i=0;i<nB;i++) icB[i]=(int)cB64[i];
-        for(size_t i=0;i<nD;i++) icD[i]=(int)cD64[i];
 
         int invalid=0;
-        for(size_t i=0;i+1<nB;i++) if(icB[i]%BS) invalid=1;
-        for(size_t i=0;i+1<nD;i++) if(icD[i]%BS) invalid=1;
+        for(size_t i=0;i+1<nB;i++) if(cB[i]%BS) invalid=1;
+        for(size_t i=0;i+1<nD;i++) if(cD[i]%BS) invalid=1;
         for(size_t i=1;i<basec->sp_count;i++) if(basec->sp[i-1]>=basec->sp[i]) invalid=1;
         if(basec->sp[0]!=0) invalid=1;
         if(depc->sp[0]!=0) invalid=1;
@@ -649,7 +645,7 @@ static Report *analyse_iso(Udf *udf, Options *opt) {
             report_say(rep,"   Extent tables are invalid - skipped.");
             rep->problems++;
             report_pair_status(rep,stem,dbuf,"Cannot repair. Invalid extent tables.");
-            free(cB64); free(cD64); free(icB); free(icD); node_free(S);
+            free(cB); free(cD); node_free(S);
             continue;
         }
 
@@ -669,7 +665,7 @@ static Report *analyse_iso(Udf *udf, Options *opt) {
         Extent *exS=extents_of(udf,S,&exS_count);
 
         if(okB && okD && okS && exS){
-            if(!extents_match_ssif(udf,B,D,exS,exS_count,icB,(int)nB,icD,(int)nD)){
+            if(!extents_match_ssif(udf,B,D,exS,exS_count,cB,(int)nB,cD,(int)nD)){
                 report_say(rep,"   Extents valid but not SSIF-aligned - will repoint to SSIF data.");
                 okB=0; okD=0;
             }
@@ -696,7 +692,7 @@ static Report *analyse_iso(Udf *udf, Options *opt) {
             if(B) node_free(B);
             if(D) node_free(D);
             if(S) node_free(S);
-            free(exS); free(cB64); free(cD64); free(icB); free(icD);
+            free(exS); free(cB); free(cD);
             continue;
         }
 
@@ -714,7 +710,7 @@ static Report *analyse_iso(Udf *udf, Options *opt) {
             if(B) node_free(B);
             if(D) node_free(D);
             if(S) node_free(S);
-            free(exS); free(cB64); free(cD64); free(icB); free(icD);
+            free(exS); free(cB); free(cD);
             continue;
         }
 
@@ -723,8 +719,8 @@ static Report *analyse_iso(Udf *udf, Options *opt) {
         memset(t,0,sizeof(*t));
         strcpy(t->stem,stem); strcpy(t->dstem,dbuf);
         t->kind=kind; t->B=B; t->D=D; t->S=S;
-        t->cB=icB; t->cD=icD; t->nB=(int)nB; t->nD=(int)nD; t->okB=okB; t->okD=okD;
-        free(exS); free(cB64); free(cD64);
+        t->cB=cB; t->cD=cD; t->nB=(int)nB; t->nD=(int)nD; t->okB=okB; t->okD=okD;
+        free(exS);
     }
 
     if(todo_count) report_say(rep,"%s",opt->apply?"\nApplying Repairs:":"\nPlanned Repairs:");

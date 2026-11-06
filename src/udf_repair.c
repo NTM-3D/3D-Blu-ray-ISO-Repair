@@ -122,7 +122,7 @@ void udf_grow_iso(Udf *u, uint64_t needed_blocks, Report *rep) {
 
 uint32_t *udf_alloc_blocks(Udf *u, int ref, size_t count, size_t *out_count, Report *rep) {
     PartMap *m = &u->maps[ref];
-    if (!(m->kind==1 && m->bitmap==0xFFFFFFFF)) udf_error("Unsupported allocation partition.");
+    if (!(m->kind==1 && m->bitmap==0xFFFFFFFF)) udf_error("Unsupported allocation partition %d.", ref);
     uint32_t *got = xmalloc2((count?count:1)*sizeof(uint32_t));
     size_t gotn=0;
     UintSet *used = &m->ro_used;
@@ -159,13 +159,13 @@ int udf_rewrite_file(Udf *u, Node *n, Extent *exts, size_t ext_count, uint64_t l
     if (alloc==0) {
         PartMap *m = &u->maps[n->ref];
         int want = (m->kind==1) ? m->phys_ref : n->ref;
-        for (size_t i=0;i<ext_count;i++) if (exts[i].ref != want) udf_error("Extents live in a different partition.");
+        for (size_t i=0;i<ext_count;i++) if (exts[i].ref != want) udf_error("%s: Extents live in a different partition than short allocation descriptors can address.", n->name);
     }
     size_t dat_len = ext_count*s;
     unsigned char *dat = xmalloc2(dat_len?dat_len:1);
     size_t p=0;
     for (size_t i=0;i<ext_count;i++) {
-        if (exts[i].len > MAX_EXT) udf_error("Extent too long.");
+        if (exts[i].len > MAX_EXT) udf_error("Internal: Extent too long.");
         if (alloc==0) {
             uint32_t ln=(uint32_t)exts[i].len; uint32_t l=exts[i].lbn;
             memcpy(dat+p,&ln,4); p+=4; memcpy(dat+p,&l,4); p+=4;

@@ -10,6 +10,7 @@
 #define PKT 192
 #define MAX_EXT 0x3FFFF800u
 #define JOURNAL_MAGIC "UDFFIX01"
+#define UDF_FT_REALTIME 249
 
 typedef struct { uint64_t sec; unsigned char data[BS]; } PendingSec;
 
@@ -45,6 +46,8 @@ typedef struct {
     uint32_t meta;
     uint32_t mirror;
     uint32_t bitmap;
+    uint32_t alloc_unit;
+    uint16_t align_unit;
     uint64_t blocks;
     MetaExtentList ext;
     MetaExtentList mirror_ext;
@@ -95,6 +98,8 @@ typedef struct {
     uint64_t *pd_sectors;
     size_t pd_sectors_count;
     size_t pd_sectors_cap;
+    uint32_t integrity_loc;
+    uint32_t integrity_len;
     PartMap *maps;
     size_t maps_count;
     size_t maps_cap;
@@ -126,6 +131,7 @@ void image_restore(Image *img, ImageSnap *snap);
 /* UDF */
 Udf *udf_create(Image *img);
 void udf_destroy(Udf *u);
+void udf_refresh(Udf *u);
 Node *udf_load(Udf *u, int ref, uint32_t lbn, const char *name);
 unsigned char *udf_read_file(Udf *u, Node *n, size_t *out_len);
 void node_free(Node *n);
@@ -134,8 +140,10 @@ unsigned char *udf_read_blocks(Udf *u, int ref, uint32_t lbn, size_t count);
 int udf_sync_ok(Udf *u, int ref, uint32_t lbn);
 void udf_put_block(Udf *u, int ref, uint32_t lbn, const unsigned char *data);
 void udf_grow_iso(Udf *u, uint64_t needed_blocks, Report *rep);
+int udf_repair_overlapping_metadata(Udf *u, Report *rep);
 uint32_t *udf_alloc_blocks(Udf *u, int ref, size_t count, size_t *out_count, Report *rep);
 int udf_rewrite_file(Udf *u, Node *n, Extent *exts, size_t ext_count, uint64_t length, int alloc, int counts_aed, Report *rep);
+int udf_set_file_type(Udf *u, Node *n, uint8_t file_type);
 /* extents helpers */
 Extent *extents_of(Udf *u, Node *n, size_t *out_count); /* NULL if not all recorded; caller frees */
 

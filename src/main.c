@@ -8,7 +8,7 @@
 static const char *PROG = "3d_bluray_iso_repair_v" BR3D_VERSION ".exe";
 
 static void usage_line(FILE *out) {
-    fprintf(out, "usage: %s [-h] [-help] [-apply] [-undo] [-order {DB,BD}] [-chatty]\n", PROG);
+    fprintf(out, "usage: %s [-h] [-help] [-apply] [-undo] [-order {DB,BD}] [-chatty] [-realtime-streams]\n", PROG);
     fprintf(out, "       [-no-data-check] [-show-all] input\n");
 }
 
@@ -34,6 +34,7 @@ static void help(void) {
     printf("  -order {DB,BD}        Manually override chunk order (default: auto-detected)\n");
     printf("  -chatty               Show detailed technical output (single ISO mode)\n");
     printf("  -no-data-check        Skip MPEG-TS sync-byte probes\n");
+    printf("  -realtime-streams     Set .m2ts/.ssif UDF file types to RealtimeFile (single ISO)\n");
     printf("  -show-all             In folder mode, also list ISOs that have no issues\n");
 }
 
@@ -69,6 +70,8 @@ static int parse_args(int argc, char **argv, const char **input, Options *opt, i
             opt->chatty = 1;
         } else if (strcmp(a, "-no-data-check") == 0) {
             opt->no_data_check = 1;
+        } else if (strcmp(a, "-realtime-streams") == 0) {
+            opt->realtime_streams = 1;
         } else if (strcmp(a, "-show-all") == 0) {
             opt->show_all = 1;
         } else if (strcmp(a, "-order") == 0) {
@@ -130,7 +133,13 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (is_dir(input)) return run_folder(input, &opt);
+    if (is_dir(input)) {
+        if (opt.realtime_streams) {
+            fprintf(stderr, "Error: -realtime-streams requires a single ISO file.\n");
+            return 2;
+        }
+        return run_folder(input, &opt);
+    }
     if (!is_file(input)) {
         fprintf(stderr, "Error: not a file or folder: %s\n", input);
         return 2;

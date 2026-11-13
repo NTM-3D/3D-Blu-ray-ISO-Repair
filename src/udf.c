@@ -4,6 +4,10 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <io.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <share.h>
+#include <sys/stat.h>
 
 ErrCtx *g_err = NULL;
 static void udf_setup_meta(Udf *u);
@@ -69,8 +73,10 @@ Image *image_open(const char *path, int rw) {
     img->path = strdup(path);
     img->f = fopen(path, rw ? "r+b" : "rb");
     if (!img->f) { udf_error("Cannot open %s", path); }
-    _fseeki64(img->f, 0, SEEK_END);
-    img->orig_size = (uint64_t)_ftelli64(img->f);
+    if (_fseeki64(img->f, 0, SEEK_END) != 0) udf_error("Cannot determine image size.");
+    long long length = _ftelli64(img->f);
+    if (length < 0) udf_error("Cannot determine image size.");
+    img->orig_size = (uint64_t)length;
     img->size = img->orig_size;
     return img;
 }
@@ -94,9 +100,14 @@ static PendingSec *find_pending(Image *img, uint64_t sec) {
 
 unsigned char *image_read(Image *img, uint64_t off, size_t n) {
     unsigned char *d = xmalloc(n);
-    _fseeki64(img->f, (long long)off, SEEK_SET);
-    size_t got = fread(d,1,n,img->f);
-    if (got < n) memset(d+got,0,n-got);
+    size_t expected = off < img->orig_size
+        ? (size_t)((img->orig_size - off < n) ? img->orig_size - off : n) : 0;
+    if (expected && (_fseeki64(img->f, (long long)off, SEEK_SET) != 0 ||
+                     fread(d,1,expected,img->f) != expected)) {
+        free(d);
+        udf_error("Cannot read image at byte offset %llu.", (unsigned long long)off);
+    }
+    if (expected < n) memset(d+expected,0,n-expected);
     if (img->pending_count) {
         uint64_t first = off / BS;
         uint64_t last = (off + (n?n:1) - 1) / BS;
@@ -132,7 +143,7 @@ void image_put(Image *img, uint64_t sec, const unsigned char *data) {
 
 void image_snapshot(Image *img, ImageSnap *snap) {
     snap->pending_count = img->pending_count;
-    snap->pending_cap = img->pending_cap;
+    snap->pending_cap = img->pending_count;
     snap->size = img->size;
     snap->pending = NULL;
     if (img->pending_count) {
@@ -153,21 +164,22 @@ void image_restore(Image *img, ImageSnap *snap) {
 
 int image_apply(Image *img) {
     char jpath[4096];
-    snprintf(jpath, sizeof(jpath), "%s.udffix-undo", img->path);
-    FILE *probe = fopen(jpath, "rb");
-    if (probe) {
-        fclose(probe);
-        udf_error("Undo journal already exists (%s). Run -undo first or remove it.", jpath);
-    }
-    FILE *j = fopen(jpath, "wb");
-    if (!j) { udf_error("Cannot create undo journal."); }
-    fwrite(JOURNAL_MAGIC,1,8,j);
+    int path_len = snprintf(jpath, sizeof(jpath), "%s.udffix-undo", img->path);
+    if (path_len < 0 || (size_t)path_len >= sizeof(jpath) || img->pending_count > UINT32_MAX)
+        udf_error("Cannot create undo journal: path or sector count is too large.");
+    int fd = -1;
+    if (_sopen_s(&fd, jpath, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                 _SH_DENYRW, _S_IREAD | _S_IWRITE) != 0)
+        udf_error("Cannot create undo journal (%s); it may already exist.", jpath);
+    FILE *j = _fdopen(fd, "wb");
+    if (!j) { _close(fd); udf_error("Cannot open undo journal."); }
+    if (fwrite(JOURNAL_MAGIC,1,8,j) != 8) { fclose(j); udf_error("Cannot write undo journal."); }
     /* orig_size (8) + count (4) */
     unsigned char hdr[12];
     memcpy(hdr, &img->orig_size, 8);
     uint32_t cnt = (uint32_t)img->pending_count;
     memcpy(hdr+8, &cnt, 4);
-    fwrite(hdr,1,12,j);
+    if (fwrite(hdr,1,12,j) != 12) { fclose(j); udf_error("Cannot write undo journal."); }
     /* sort pending by sec */
     /* simple insertion sort */
     for (size_t a=1;a<img->pending_count;a++) {
@@ -178,24 +190,32 @@ int image_apply(Image *img) {
     }
     for (size_t i=0;i<img->pending_count;i++) {
         uint64_t sec = img->pending[i].sec;
-        fwrite(&sec,1,8,j);
+        if (fwrite(&sec,1,8,j) != 8) { fclose(j); udf_error("Cannot write undo journal."); }
         /* read original sector */
         unsigned char *old = xmalloc(BS);
-        _fseeki64(img->f, (long long)(sec*BS), SEEK_SET);
-        size_t got = fread(old,1,BS,img->f);
-        if (got < BS) memset(old+got,0,BS-got);
-        fwrite(old,1,BS,j);
+        uint64_t off = sec * BS;
+        size_t expected = off < img->orig_size
+            ? (size_t)((img->orig_size - off < BS) ? img->orig_size - off : BS) : 0;
+        if (expected && (_fseeki64(img->f, (long long)off, SEEK_SET) != 0 ||
+                         fread(old,1,expected,img->f) != expected)) {
+            free(old); fclose(j);
+            udf_error("Cannot read original sector %llu for undo journal.", (unsigned long long)sec);
+        }
+        if (expected < BS) memset(old+expected,0,BS-expected);
+        if (fwrite(old,1,BS,j) != BS) { free(old); fclose(j); udf_error("Cannot write undo journal."); }
         free(old);
     }
     if (fflush(j) != 0 || _commit(_fileno(j)) != 0) {
-        fclose(j);
+        if (fclose(j) != 0) udf_error("Cannot close undo journal.");
         udf_error("Cannot flush undo journal to disk.");
     }
     fclose(j);
     /* write pending */
     for (size_t i=0;i<img->pending_count;i++) {
-        _fseeki64(img->f, (long long)(img->pending[i].sec*BS), SEEK_SET);
-        fwrite(img->pending[i].data,1,BS,img->f);
+        if (_fseeki64(img->f, (long long)(img->pending[i].sec*BS), SEEK_SET) != 0 ||
+            fwrite(img->pending[i].data,1,BS,img->f) != BS)
+            udf_error("Cannot write image sector %llu; the undo journal has been retained.",
+                      (unsigned long long)img->pending[i].sec);
     }
     if (fflush(img->f) != 0 || _commit(_fileno(img->f)) != 0) {
         udf_error("Cannot flush repaired image to disk.");
@@ -207,7 +227,15 @@ int image_apply(Image *img) {
 
 int image_undo(const char *path) {
     char jpath[4096];
-    snprintf(jpath, sizeof(jpath), "%s.udffix-undo", path);
+    char done[4096];
+    int jl = snprintf(jpath, sizeof(jpath), "%s.udffix-undo", path);
+    int dl = snprintf(done, sizeof(done), "%s.udffix-undo.done", path);
+    if (jl < 0 || dl < 0 || (size_t)jl >= sizeof(jpath) || (size_t)dl >= sizeof(done))
+        udf_error("Cannot undo: journal path is too long.");
+    struct _stat64 st;
+    if (_stat64(done, &st) == 0)
+        udf_error("Previous undo journal exists (%s); archive it before undoing.", done);
+    if (errno != ENOENT) udf_error("Cannot check previous undo journal (%s).", done);
     FILE *j = fopen(jpath, "rb");
     if (!j) { udf_error("No undo journal found (%s).", jpath); }
     char magic[8];
@@ -229,16 +257,20 @@ int image_undo(const char *path) {
     typedef struct { uint64_t sec; unsigned char data[BS]; } Rec;
     Rec *recs = xmalloc((size_t)n*sizeof(Rec));
     for (uint32_t i=0;i<n;i++) {
-        fread(&recs[i].sec,1,8,j);
+        if (fread(&recs[i].sec,1,8,j)!=8) { fclose(j); udf_error("Journal is truncated."); }
         if (fread(recs[i].data,1,BS,j)!=BS) { fclose(j); udf_error("Journal is truncated."); }
     }
     fclose(j);
     FILE *f = fopen(path, "r+b");
     if (!f) { udf_error("Cannot open ISO."); }
     for (uint32_t i=0;i<n;i++) {
-        if (recs[i].sec*BS < orig_size) {
-            _fseeki64(f, (long long)(recs[i].sec*BS), SEEK_SET);
-            fwrite(recs[i].data,1,BS,f);
+        if (recs[i].sec <= UINT64_MAX / BS && recs[i].sec*BS < orig_size) {
+            if (_fseeki64(f, (long long)(recs[i].sec*BS), SEEK_SET) != 0 ||
+                fwrite(recs[i].data,1,BS,f) != BS) {
+                fclose(f);
+                udf_error("Cannot restore image sector %llu; the undo journal has been retained.",
+                          (unsigned long long)recs[i].sec);
+            }
         }
     }
     if (fflush(f) != 0) { fclose(f); udf_error("Cannot flush restored image to disk."); }
@@ -247,12 +279,8 @@ int image_undo(const char *path) {
     fclose(f);
     free(recs);
     /* rename journal to .done */
-    char done[4096];
-    snprintf(done, sizeof(done), "%s.udffix-undo.done", path);
-    remove(done);
     if (rename(jpath, done) != 0) {
-        /* Python falls back to deleting the journal when the rename fails. */
-        remove(jpath);
+        udf_error("Image restored, but the undo journal could not be renamed; it has been retained.");
     }
     return (int)n;
 }
@@ -333,6 +361,8 @@ Udf *udf_create(Image *img) {
     }
     /* check bs */
     if (u32(lvd,212) != BS) udf_error("Logical block size is not 2048.");
+    u->integrity_len = u32(lvd,432);
+    u->integrity_loc = u32(lvd,436);
     /* partition maps */
     /* parse at offset 440, count u32(lvd,268) */
     int nmaps = (int)u32(lvd,268);
@@ -351,7 +381,7 @@ Udf *udf_create(Image *img) {
             memset(m,0,sizeof(PartMap));
             m->kind=0;
             m->part = u16(lvd, off+4);
-        } else if (t==2 && memcmp(lvd+off+5, "*UDF Metadata Partition", 23)==0) {
+        } else if (t==2 && l >= 64 && off + 64 <= BS && memcmp(lvd+off+5, "*UDF Metadata Partition", 23)==0) {
             PartMap *m = &u->maps[u->maps_count++];
             memset(m,0,sizeof(PartMap));
             m->kind=1;
@@ -359,6 +389,8 @@ Udf *udf_create(Image *img) {
             m->meta = u32(lvd, off+40);
             m->mirror = u32(lvd, off+44);
             m->bitmap = u32(lvd, off+48);
+            m->alloc_unit = u32(lvd, off+52);
+            m->align_unit = u16(lvd, off+56);
             m->blocks=0;
             m->has_mirror_ext=0;
             m->phys_ref=-1;
@@ -545,6 +577,14 @@ void udf_destroy(Udf *u) {
     free(u->maps);
     free(u->pd_sectors);
     free(u);
+}
+
+void udf_refresh(Udf *u) {
+    Udf *fresh = udf_create(u->img);
+    Udf old = *u;
+    *u = *fresh;
+    *fresh = old;
+    udf_destroy(fresh);
 }
 
 unsigned char *udf_read_blocks(Udf *u, int ref, uint32_t lbn, size_t count) {

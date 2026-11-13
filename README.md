@@ -45,6 +45,10 @@ gcc -O2 -std=c11 -Wall -Wextra -o 3d_bluray_iso_repair.exe \
 
 On Windows the executable carries a `VERSIONINFO` resource from `src/version.rc`. `build.bat` needs `gcc` and `windres` on `PATH`, or the `CC` and `RC` environment variables pointing to them.
 
+When metadata must grow, the tool relocates the small metadata partition and its mirror into contiguous extents, placing the mirror before the primary metadata. It updates the volume integrity sizes and keeps the end anchors outside the physical partition. This avoids readers losing access to allocation descriptors in a second metadata extent, but readers that cannot follow allocation extent descriptors may still not support the repaired stream files. Growth is refused if the existing metadata mirror or integrity information is inconsistent.
+
+The tool detects an end anchor overlapping an empty mirror block alongside inconsistent integrity sizes. It validates the remaining metadata before staging a contiguous relocation. Other fragmented metadata layouts are reported as potentially incompatible and are not automatically compacted.
+
 ## Usage
 
 ```
@@ -62,6 +66,7 @@ Run with no arguments, `-h` or `-help` to print the built-in help.
 | `-order DB\|BD` | Force the interleaving chunk order instead of auto-detecting it |
 | `-chatty` | Show detailed technical output (single ISO mode) |
 | `-no-data-check` | Skip the MPEG-TS sync-byte probes |
+| `-realtime-streams` | Set `.m2ts` and `.ssif` UDF file types to `RealtimeFile` (249); single ISO mode only |
 | `-show-all` | In folder mode, also list ISOs that have no issues |
 | `-h`, `-help` | Print help |
 
@@ -91,6 +96,8 @@ Verifying the repaired image...
 All 3D clip pairs are consistent now.
 ```
 
+`-realtime-streams` sets the UDF file type of `.m2ts` and `.ssif` entries to `RealtimeFile` (249) and updates their descriptor checksums. It does not change media data and works with one ISO at a time.
+
 ### Undo
 
 An `-apply` run writes a journal next to the ISO:
@@ -107,6 +114,7 @@ Restored 99 sector(s). Image is back to its previous state.
 ```
 
 Keep the journal until the repaired image has been tested. An existing journal prevents a second `-apply` from overwriting it.
+If a `.udffix-undo.done` file already exists, archive it before running `-undo`; the tool will not overwrite the previous journal.
 
 ### Folder mode
 
@@ -129,3 +137,13 @@ The chunk order is detected from MPEG-TS sync bytes in the streams. `-order` for
 - Always work on a copy of the ISO.
 - Keep the generated `.udffix-undo` journal until playback has been verified.
 - Use `-undo` to revert changes and restore the original image size.
+
+## Credits
+
+The following projects provided reference implementations and validation tools:
+
+- [tsMuxer, teaching-droid fork](https://github.com/teaching-droid/tsMuxer) — reference for Blu-ray 3D metadata, interleaving, and UDF stream file types.
+- [libudfread](https://code.videolan.org/videolan/libudfread) — independent UDF reader used to validate file reads.
+- [edge264-mvc](https://github.com/jens-duttke/edge264-mvc) — MVC decoder used to verify both video views.
+- [NanaZip](https://github.com/M2Team/NanaZip) — independent UDF compatibility checks.
+- [FFmpeg](https://ffmpeg.org/) and [libbluray](https://code.videolan.org/videolan/libbluray) — media and Blu-ray navigation probing.

@@ -9,6 +9,7 @@ typedef struct {
     int chatty;
     int show_all;
     int no_data_check;
+    int realtime_streams;
     char order[4]; /* "DB" or "BD" or "" */
 } Options;
 

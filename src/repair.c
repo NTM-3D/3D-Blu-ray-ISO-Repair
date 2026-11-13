@@ -510,6 +510,9 @@ static int cmp_strp(const void *a,const void *b){ return strcmp(*(const char**)a
 
 static Report *analyse_iso(Udf *udf, Options *opt) {
     Report *rep = report_create(opt->chatty);
+    rep->metadata_repaired = udf_repair_overlapping_metadata(udf, rep);
+    if (udf->maps_count > 1 && udf->maps[1].kind == 1 && udf->maps[1].ext.count > 1)
+        rep->metadata_fragmented = 1;
 
     Node *streams = udf_lookup_path(udf, "BDMV/STREAM");
     Node *ssifd = udf_lookup_path(udf, "BDMV/STREAM/SSIF");
@@ -749,6 +752,7 @@ static Report *analyse_iso(Udf *udf, Options *opt) {
             rep->problems++;
             report_add_error(rep,"%s / %s: %s",t->stem,t->dstem,emsg);
             image_restore(udf->img,&snap);
+            udf_refresh(udf);
             char st[512]; snprintf(st,sizeof(st),"Cannot repair. %s",emsg);
             report_pair_set_status(rep,t->stem,st);
         }
@@ -792,6 +796,10 @@ static void print_single(const char *path,Image *img,Report *rep,Options *opt){
     int blocking=report_blocking_count(rep);
 
     printf("\n");
+    if(rep->metadata_repaired)
+        printf("Metadata partition repair planned.\n");
+    if(rep->metadata_fragmented)
+        printf("Warning: fragmented metadata may be unsupported by some readers; automatic repair is unavailable.\n");
     if(opt->chatty){
         if(issues){
             printf("Repairable pairs\n");
@@ -811,10 +819,11 @@ static void print_single(const char *path,Image *img,Report *rep,Options *opt){
                 printf("  %s / %s   %s\n",p->stem,p->dstem[0]?p->dstem:"-----",p->status);
             }
         }
-        if(!issues && !blocking) printf("No problems found.\n");
+        if(!issues && !blocking && !rep->metadata_repaired && !rep->metadata_fragmented)
+            printf("No problems found.\n");
     } else {
         if(issues){
-            printf("%s: %d clip pair(s).\n",opt->apply?"Repaired":"Can repair",issues);
+            printf("%s: %d clip pair(s).\n",opt->apply?"Will repair":"Can repair",issues);
             /* Sorted label counts. */
             typedef struct { const char *label; int count; } KC;
             KC kinds[64]; size_t nk=0;
@@ -829,7 +838,8 @@ static void print_single(const char *path,Image *img,Report *rep,Options *opt){
             for(size_t i=0;i<nk;i++) printf("  %s: %d\n",kinds[i].label,kinds[i].count);
         }
         if(blocking) printf("Needs manual repair: %d clip pair(s). Use -chatty for details.\n",blocking);
-        if(!issues && !blocking) printf("No problems found.\n");
+        if(!issues && !blocking && !rep->metadata_repaired && !rep->metadata_fragmented)
+            printf("No problems found.\n");
     }
 
     if(img->pending_count==0){
@@ -837,35 +847,81 @@ static void print_single(const char *path,Image *img,Report *rep,Options *opt){
         return;
     }
     printf("\n");
-    if(opt->apply) printf("Repairs written successfully.\n");
-    else printf("Run again with -apply to write the repairs.\n");
+    if(!opt->apply) printf("Run again with -apply to write the repairs.\n");
+}
+
+static size_t set_realtime_stream_types(Udf *u, size_t *file_count, int patch) {
+    Node *streams = udf_lookup_path(u, "BDMV/STREAM");
+    Node *ssif = udf_lookup_path(u, "BDMV/STREAM/SSIF");
+    if (!streams || !ssif)
+        udf_error("BDMV/STREAM or BDMV/STREAM/SSIF not found.");
+
+    size_t mismatches = 0;
+    Node *dirs[] = {streams, ssif};
+    const char *suffixes[] = {".M2TS", ".SSIF"};
+    for (size_t d = 0; d < 2; d++) {
+        DirList entries = udf_listdir(u, dirs[d]);
+        for (size_t i = 0; i < entries.count; i++) {
+            if (!ends_with_ci(entries.items[i].name, suffixes[d])) continue;
+            Node *n = udf_load(u, entries.items[i].ref, entries.items[i].lbn, entries.items[i].name);
+            (*file_count)++;
+            if (n->ftype != UDF_FT_REALTIME) {
+                mismatches++;
+                if (patch) udf_set_file_type(u, n, UDF_FT_REALTIME);
+            }
+            node_free(n);
+        }
+        free(entries.items);
+        node_free(dirs[d]);
+    }
+    return mismatches;
 }
 
 int run_single(const char *path, Options *opt) {
     Image *img=image_open(path,opt->apply);
     Udf *udf=udf_create(img);
     Report *rep=analyse_iso(udf,opt);
+    size_t stream_file_count=0;
+    size_t stream_type_mismatches=0;
+    if(opt->realtime_streams) {
+        stream_type_mismatches=set_realtime_stream_types(udf,&stream_file_count,1);
+        printf("\nRealtimeFile UDF type: %zu of %zu stream file(s) %s.\n",
+               stream_type_mismatches,stream_file_count,
+               stream_type_mismatches ? "will be updated" : "already set");
+    }
     print_single(path,img,rep,opt);
 
     int rc=0;
+    if(opt->apply && rep->problems){
+        printf("Repair blocked by unresolved errors; no changes were written.\n");
+        report_free(rep); udf_destroy(udf); image_close(img);
+        return 1;
+    }
     if(img->pending_count==0){
         rc=rep->problems?1:0;
         report_free(rep); udf_destroy(udf); image_close(img);
         return rc;
     }
     if(!opt->apply){
+        rc=rep->problems?1:0;
         report_free(rep); udf_destroy(udf); image_close(img);
-        return 0;
+        return rc;
     }
 
     image_apply(img);
+    printf("Repairs written successfully.\n");
     printf("\nVerifying the repaired image...\n");
     Image *img2=image_open(path,0);
     Udf *udf2=udf_create(img2);
     Options dry=*opt; dry.apply=0; dry.chatty=0;
     Report *rep2=analyse_iso(udf2,&dry);
-    if(!rep2->problems && img2->pending_count==0){
+    size_t verified_stream_files=0;
+    size_t remaining_stream_type_mismatches=opt->realtime_streams
+        ? set_realtime_stream_types(udf2,&verified_stream_files,0) : 0;
+    if(!rep2->problems && img2->pending_count==0 && remaining_stream_type_mismatches==0){
         printf("All 3D clip pairs are consistent now.\n");
+        if(opt->realtime_streams)
+            printf("All %zu .m2ts/.ssif entries use RealtimeFile.\n",verified_stream_files);
         rc=0;
     } else {
         printf("Verification found remaining issues. Run with -chatty for details.\n");
@@ -893,11 +949,21 @@ static int scan_folder_image(const char *path, Options *opt, int *issues, int *f
     Udf *udf=udf_create(img);
     Options dry=*opt; dry.apply=0; dry.chatty=0;
     Report *rep=analyse_iso(udf,&dry);
-    int n_issues=report_issue_count(rep);
+    int pair_issues=report_issue_count(rep);
+    int n_issues=pair_issues + !!rep->metadata_repaired + !!rep->metadata_fragmented;
     int blocking=report_blocking_count(rep)+(int)rep->errors_count;
     report_format_repair_counts(rep,summary,sumsize);
+    if(rep->metadata_repaired){
+        size_t used=strlen(summary);
+        snprintf(summary+used,sumsize-used,"%sMetadata partition repair",used?"; ":"");
+    }
+    if(rep->metadata_fragmented){
+        size_t used=strlen(summary);
+        snprintf(summary+used,sumsize-used,"%sFragmented metadata needs review",used?"; ":"");
+    }
     if(summary[0]==0) snprintf(summary,sumsize,"Needs manual repair");
-    int fix=(n_issues>0 && blocking==0 && rep->problems==0 && img->pending_count>0);
+    int fix=(n_issues>0 && blocking==0 && rep->problems==0 &&
+             !rep->metadata_fragmented && img->pending_count>0);
     if(n_issues==0) snprintf(summary,sumsize,"Clean");
     *issues=n_issues; *fixable=fix;
     report_free(rep); udf_destroy(udf); image_close(img);

@@ -15,6 +15,8 @@ typedef struct { char stem[64]; char label[128]; } RepairKindRec;
 struct Report {
     int chatty;
     int problems;
+    int metadata_repaired;
+    int metadata_fragmented;
     PairStatus *pairs; size_t pairs_count, pairs_cap;
     ChangeRec *changes; size_t changes_count, changes_cap;
     char **fixed; size_t fixed_count, fixed_cap;

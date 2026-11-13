@@ -1,7 +1,7 @@
 /* The only place the version is set; the code, the Windows resource and the
    build scripts all read it from here. */
 #define BR3D_VER_MAJOR 0
-#define BR3D_VER_MINOR 1
+#define BR3D_VER_MINOR 2
 #define BR3D_VER_PATCH 0
 
 #define BR3D_STR_(x) #x

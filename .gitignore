@@ -3,3 +3,5 @@
 *.obj
 *.udffix-undo
 *.udffix-undo.done
+/PLAN.md
+/tests/

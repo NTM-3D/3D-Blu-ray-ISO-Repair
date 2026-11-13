@@ -6,118 +6,277 @@
 static void *xmalloc2(size_t n){ void*p=malloc(n?n:1); if(!p) udf_error("Out of memory."); return p; }
 static void *xrealloc2(void*p,size_t n){ void*q=realloc(p,n?n:1); if(!q) udf_error("Out of memory."); return q; }
 
-void udf_grow_iso(Udf *u, uint64_t needed_blocks, Report *rep) {
+static int descriptor_valid(const unsigned char *data, int id) {
+    uint16_t len = u16(data,10);
+    if (tag_id(data) != id || len > BS-16) return 0;
+    unsigned char copy[BS];
+    memcpy(copy, data, BS);
+    seal(copy, len);
+    return u16(copy,8) == u16(data,8);
+}
+
+int udf_repair_overlapping_metadata(Udf *u, Report *rep) {
+    if (u->maps_count <= 1 || u->maps[1].kind != 1) return 0;
     PartMap *m = &u->maps[1];
-    int pref = m->phys_ref;
-    uint64_t alloc_unit = 128;
-    uint64_t add_blocks = ((needed_blocks + alloc_unit - 1)/alloc_unit)*alloc_unit;
-    int has_mirror = (m->mirror != 0xFFFFFFFF);
-    uint64_t total_add = add_blocks * (has_mirror ? 2 : 1);
-    uint64_t old_iso_size = u->img->size;
-    uint64_t old_N = old_iso_size / BS;
-    uint64_t new_N = old_N + total_add;
-    image_grow(u->img, new_N*BS);
+    if (m->mirror == UINT32_MAX || !m->has_mirror_ext ||
+        !m->mirror_ext.count || u->img->size % BS) return 0;
+    uint64_t n = u->img->size / BS;
+    if (m->part < 0 || m->part >= 16 || !u->pd_valid[m->part])
+        udf_error("Cannot inspect metadata: invalid physical partition.");
+    uint64_t start = u->pd_start[m->part];
+    size_t last = m->mirror_ext.count - 1;
+    uint64_t mirror_end = start + m->mirror_ext.lbn[last] + m->mirror_ext.nb[last];
+    if (mirror_end != n) return 0;
 
-    /* partition 0 length */
-    uint64_t grown_len = (has_mirror ? (old_N + add_blocks) : old_N) - u->pd_start[0] + add_blocks;
-    uint32_t new_p_len = (uint32_t)(grown_len > u->pd_length[0] ? grown_len : u->pd_length[0]);
-    u->pd_length[0] = new_p_len;
+    if (m->ext.count != 2 || m->mirror_ext.count != 2 ||
+        m->phys_ref < 0 || (size_t)m->phys_ref >= u->maps_count ||
+        !m->ext.nb[0] || m->ext.nb[0] != m->mirror_ext.nb[0] ||
+        !m->ext.nb[1] || m->ext.nb[1] != m->mirror_ext.nb[1] ||
+        m->blocks != (uint64_t)m->ext.nb[0] + m->ext.nb[1] ||
+        m->mirror_ext.lbn[1] != (uint64_t)m->ext.lbn[1] + m->ext.nb[1] ||
+        (uint64_t)m->ext.lbn[1] + m->ext.nb[1] + m->mirror_ext.nb[1] != n - start ||
+        u->pd_length[m->part] != n - start)
+        udf_error("Cannot repair metadata: end anchor overlaps an unsupported mirror layout.");
 
-    for (size_t i=0;i<u->pd_sectors_count;i++) {
+    unsigned char *anchor = image_sector(u->img, n - 1);
+    if (!descriptor_valid(anchor, 2) || u32(anchor,12) != n - 1) {
+        free(anchor);
+        udf_error("Cannot repair metadata: overlapping end anchor is invalid.");
+    }
+    free(anchor);
+
+    uint64_t old_end = start + m->ext.lbn[1];
+    if (old_end == 0 || old_end > n)
+        udf_error("Cannot repair metadata: invalid original image boundary.");
+    unsigned char *old_anchor = image_sector(u->img, old_end - 1);
+    int old_anchor_ok = descriptor_valid(old_anchor, 2) && u32(old_anchor,12) == old_end - 1;
+    free(old_anchor);
+    if (!old_anchor_ok)
+        udf_error("Cannot repair metadata: original end anchor is missing.");
+
+    if (!u->integrity_len || u->integrity_len % BS ||
+        (uint64_t)u->integrity_loc + u->integrity_len / BS > n)
+        udf_error("Cannot repair metadata: unsupported integrity sequence.");
+    uint64_t integrity_sec = 0;
+    int terminated = 0;
+    for (uint32_t i=0; i<u->integrity_len / BS; i++) {
+        uint64_t sec = (uint64_t)u->integrity_loc + i;
+        unsigned char *b = image_sector(u->img, sec);
+        int id = tag_id(b);
+        if (id == 8) { terminated = 1; free(b); break; }
+        uint32_t count = u32(b,72);
+        uint16_t crc_len = u16(b,10);
+        if (id != 9 || !descriptor_valid(b, 9) || integrity_sec || u32(b,32) ||
+            count != u->maps_count || count > (BS-80)/8 ||
+            80 + 8 * count > 16u + crc_len) {
+            free(b);
+            udf_error("Cannot repair metadata: unsupported integrity descriptor.");
+        }
+        uint32_t old_part = u32(b,80 + 4*count + 4*m->phys_ref);
+        uint32_t old_meta = u32(b,80 + 4*count + 4);
+        if (old_meta != m->ext.nb[0] || old_part > old_end - start ||
+            (uint64_t)m->ext.lbn[0] + m->ext.nb[0] > old_part ||
+            (uint64_t)m->mirror_ext.lbn[0] + m->mirror_ext.nb[0] > old_part) {
+            free(b);
+            udf_error("Cannot repair metadata: integrity sizes do not match the metadata layout.");
+        }
+        integrity_sec = sec;
+        free(b);
+    }
+    if (!integrity_sec || !terminated)
+        udf_error("Cannot repair metadata: incomplete integrity sequence.");
+
+    for (uint32_t k=0; k<m->blocks; k++) {
+        unsigned char *primary = image_sector(u->img, udf_sector_of(u,1,k,0));
+        unsigned char *mirror = image_sector(u->img, udf_sector_of(u,1,k,1));
+        int differs = memcmp(primary, mirror, BS) != 0;
+        if (k == m->blocks - 1) {
+            for (size_t j=0; j<BS; j++) if (primary[j]) {
+                free(primary); free(mirror);
+                udf_error("Cannot repair metadata: overwritten mirror block is not empty in primary.");
+            }
+            if (!differs) {
+                free(primary); free(mirror);
+                udf_error("Cannot repair metadata: expected anchor overlap is absent.");
+            }
+        } else if (differs) {
+            free(primary); free(mirror);
+            udf_error("Cannot repair metadata: unexpected mirror mismatch at block %u.", k);
+        }
+        free(primary);
+        free(mirror);
+    }
+
+    unsigned char zero[BS] = {0};
+    image_put(u->img, n - 1, zero);
+    unsigned char *integrity = image_sector(u->img, integrity_sec);
+    uint32_t count = u32(integrity,72), physical = u->pd_length[m->part];
+    uint32_t blocks = (uint32_t)m->blocks;
+    memcpy(integrity + 80 + 4*count + 4*m->phys_ref, &physical, 4);
+    memcpy(integrity + 80 + 4*count + 4, &blocks, 4);
+    seal(integrity, u16(integrity,10));
+    image_put(u->img, integrity_sec, integrity);
+    free(integrity);
+    udf_grow_iso(u, 1, rep);
+    return 1;
+}
+
+void udf_grow_iso(Udf *u, uint64_t needed_blocks, Report *rep) {
+    if (u->maps_count <= 1 || u->maps[1].kind != 1)
+        udf_error("Cannot grow: expected a metadata partition at map 1.");
+    PartMap *m = &u->maps[1];
+    int pref = m->phys_ref, part = m->part;
+    int has_mirror = m->mirror != UINT32_MAX;
+    if (pref < 0 || (size_t)pref >= u->maps_count || part < 0 || part >= 16 ||
+        !u->pd_valid[part] || !m->alloc_unit || !m->align_unit ||
+        m->blocks % m->alloc_unit || (has_mirror && !m->has_mirror_ext))
+        udf_error("Cannot grow: unsupported metadata partition layout.");
+    for (size_t i=0; i<u->maps_count; i++)
+        if ((int)i != pref && u->maps[i].kind == 0 && u->maps[i].part == part)
+            udf_error("Cannot grow: physical partition has multiple maps.");
+    if (u->img->size % BS || !needed_blocks || needed_blocks > MAX_EXT / BS)
+        udf_error("Cannot grow: invalid image size or metadata request.");
+    uint64_t add = needed_blocks > 128 ? needed_blocks : 128;
+    add = ((add + m->alloc_unit - 1) / m->alloc_unit) * m->alloc_unit;
+    uint64_t blocks = m->blocks + add;
+    if (blocks > MAX_EXT / BS)
+        udf_error("Cannot grow: metadata file cannot fit in one allocation extent.");
+    uint64_t old_n = u->img->size / BS;
+    uint64_t part_start = u->pd_start[part];
+    if (old_n < part_start)
+        udf_error("Cannot grow: physical partition starts beyond image.");
+    uint64_t first = ((old_n - part_start + m->align_unit - 1) / m->align_unit) * m->align_unit;
+    uint64_t mirror = first;
+    uint64_t primary = has_mirror
+        ? ((mirror + blocks + m->align_unit - 1) / m->align_unit) * m->align_unit
+        : first;
+    uint64_t partition_end = primary + blocks;
+    uint64_t new_n = part_start + partition_end + 257;
+    if (partition_end > UINT32_MAX || new_n - 1 > UINT32_MAX)
+        udf_error("Cannot grow: resulting UDF locations exceed 32-bit limits.");
+
+    Node *meta_node = udf_load(u, pref, m->meta, "metadata");
+    Node *mirror_node = has_mirror ? udf_load(u, pref, m->mirror, "metadata-mirror") : NULL;
+    if ((meta_node->alloc != 0 && meta_node->alloc != 1) ||
+        (mirror_node && mirror_node->alloc != 0 && mirror_node->alloc != 1) ||
+        !descriptor_valid(meta_node->buf, meta_node->tag) ||
+        (mirror_node && !descriptor_valid(mirror_node->buf, mirror_node->tag)) ||
+        meta_node->info != m->blocks * BS ||
+        (mirror_node && mirror_node->info != meta_node->info))
+        udf_error("Cannot grow: metadata and mirror sizes do not match.");
+    for (size_t k=0; k<meta_node->ads.count; k++)
+        if (meta_node->ads.items[k].type != 0 || meta_node->ads.items[k].len % BS ||
+            (meta_node->ads.items[k].pref >= 0 && meta_node->ads.items[k].pref != pref) ||
+            (uint64_t)meta_node->ads.items[k].lbn + meta_node->ads.items[k].len / BS > u->pd_length[part])
+            udf_error("Cannot grow: metadata has unsupported extents.");
+    if (mirror_node) for (size_t k=0; k<mirror_node->ads.count; k++)
+        if (mirror_node->ads.items[k].type != 0 || mirror_node->ads.items[k].len % BS ||
+            (mirror_node->ads.items[k].pref >= 0 && mirror_node->ads.items[k].pref != pref) ||
+            (uint64_t)mirror_node->ads.items[k].lbn + mirror_node->ads.items[k].len / BS > u->pd_length[part])
+            udf_error("Cannot grow: metadata mirror has unsupported extents.");
+
+    unsigned char *anchor = image_sector(u->img, 256);
+    if (!descriptor_valid(anchor, 2))
+        udf_error("Cannot grow: primary volume anchor is invalid.");
+    if (!u->integrity_len || u->integrity_len % BS ||
+        (uint64_t)u->integrity_loc + u->integrity_len / BS > old_n)
+        udf_error("Cannot grow: unsupported integrity sequence.");
+    uint64_t integrity_sec = 0;
+    int terminated = 0;
+    for (uint32_t i=0; i<u->integrity_len / BS; i++) {
+        unsigned char *b = image_sector(u->img, (uint64_t)u->integrity_loc + i);
+        int id = tag_id(b);
+        if (id == 8) { terminated = 1; free(b); break; }
+        if (id == 9) {
+            uint32_t count = u32(b,72);
+            uint16_t crc_len = u16(b,10);
+            if (!descriptor_valid(b, 9) || integrity_sec || u32(b,32) || count != u->maps_count ||
+                count > (BS-80)/8 || crc_len > BS-16 ||
+                80 + 8 * count > 16u + crc_len ||
+                u32(b,80 + 4*count + 4*pref) != u->pd_length[part] ||
+                u32(b,80 + 4*count + 4) != m->blocks)
+                udf_error("Cannot grow: unsupported or inconsistent integrity descriptor.");
+            integrity_sec = (uint64_t)u->integrity_loc + i;
+        } else udf_error("Cannot grow: unsupported integrity sequence descriptor.");
+        free(b);
+    }
+    if (!integrity_sec || !terminated) udf_error("Cannot grow: incomplete integrity sequence.");
+
+    size_t partition_descriptors = 0;
+    for (size_t i=0; i<u->pd_sectors_count; i++) {
         unsigned char *pd = image_sector(u->img, u->pd_sectors[i]);
-        if (tag_id(pd)==5) {
-            pd[192]=(unsigned char)(new_p_len & 0xFF);
-            pd[193]=(unsigned char)((new_p_len>>8)&0xFF);
-            pd[194]=(unsigned char)((new_p_len>>16)&0xFF);
-            pd[195]=(unsigned char)((new_p_len>>24)&0xFF);
-            uint16_t crclen = u16(pd,10);
-            if (crclen) seal(pd, crclen);
+        if (!descriptor_valid(pd, 5))
+            udf_error("Cannot grow: invalid partition descriptor.");
+        if (u16(pd,22) == part) {
+            if (u32(pd,188) != u->pd_start[part] || u32(pd,192) != u->pd_length[part])
+                udf_error("Cannot grow: inconsistent partition descriptors.");
+            partition_descriptors++;
+        }
+        free(pd);
+    }
+    if (!partition_descriptors) udf_error("Cannot grow: physical partition descriptor missing.");
+
+    for (uint32_t k=0; k<m->blocks; k++) {
+        unsigned char *a = image_sector(u->img, udf_sector_of(u,1,k,0));
+        if (has_mirror) {
+            unsigned char *b = image_sector(u->img, udf_sector_of(u,1,k,1));
+            if (memcmp(a,b,BS))
+                udf_error("Cannot grow: metadata mirror differs at block %u.", k);
+            free(b);
+        }
+        image_put(u->img, part_start + primary + k, a);
+        if (has_mirror) image_put(u->img, part_start + mirror + k, a);
+        free(a);
+    }
+
+    uint32_t new_p_len = (uint32_t)partition_end;
+    for (size_t i=0; i<u->pd_sectors_count; i++) {
+        unsigned char *pd = image_sector(u->img, u->pd_sectors[i]);
+        if (tag_id(pd)==5 && u16(pd,22)==part) {
+            memcpy(pd+192, &new_p_len, 4);
+            uint16_t crc_len = u16(pd,10);
+            if (crc_len > BS-16) udf_error("Cannot grow: invalid partition descriptor CRC length.");
+            seal(pd, crc_len);
             image_put(u->img, u->pd_sectors[i], pd);
         }
         free(pd);
     }
+    unsigned char *integrity = image_sector(u->img, integrity_sec);
+    uint32_t count = u32(integrity,72), new_blocks = (uint32_t)blocks;
+    memcpy(integrity + 80 + 4*count + 4*pref, &new_p_len, 4);
+    memcpy(integrity + 80 + 4*count + 4, &new_blocks, 4);
+    seal(integrity, u16(integrity,10));
+    image_put(u->img, integrity_sec, integrity);
+    free(integrity);
+    u->pd_length[part] = new_p_len;
 
-    /* meta node */
-    Node *meta_node = udf_load(u, pref, m->meta, "metadata");
-    uint64_t meta_phys_lbn = old_N - u->pd_start[0];
-    size_t ec = m->ext.count + 1;
-    Extent *exts = xmalloc2(ec*sizeof(Extent));
-    size_t ei=0;
-    for (size_t k=0;k<m->ext.count;k++) {
-        exts[ei].ref=pref; exts[ei].lbn=m->ext.lbn[k]; exts[ei].len=(uint64_t)m->ext.nb[k]*BS; ei++;
+    Extent extent = {pref, (uint32_t)primary, blocks * BS};
+    udf_rewrite_file(u, meta_node, &extent, 1, extent.len, meta_node->alloc, 0, rep);
+    if (mirror_node) {
+        extent.lbn = (uint32_t)mirror;
+        udf_rewrite_file(u, mirror_node, &extent, 1, extent.len, mirror_node->alloc, 0, rep);
     }
-    exts[ei].ref=pref; exts[ei].lbn=(uint32_t)meta_phys_lbn; exts[ei].len=add_blocks*BS; ei++;
-    uint64_t total_len=0; for(size_t k=0;k<ei;k++) total_len+=exts[k].len;
-    udf_rewrite_file(u, meta_node, exts, ei, total_len, meta_node->alloc, 0, rep);
-    /* update ext list */
-    free(m->ext.lbn); free(m->ext.nb); m->ext.lbn=NULL; m->ext.nb=NULL; m->ext.count=0; m->ext.cap=0;
-    for (size_t k=0;k<ei;k++) {
-        if (m->ext.count==m->ext.cap) { m->ext.cap=m->ext.cap?m->ext.cap*2:16; m->ext.lbn=xrealloc2(m->ext.lbn,m->ext.cap*sizeof(uint32_t)); m->ext.nb=xrealloc2(m->ext.nb,m->ext.cap*sizeof(uint32_t)); }
-        m->ext.lbn[m->ext.count]=exts[k].lbn;
-        m->ext.nb[m->ext.count]=(uint32_t)(exts[k].len/BS);
-        m->ext.count++;
-    }
-    m->blocks=0; for(size_t k=0;k<m->ext.count;k++) m->blocks+=m->ext.nb[k];
-    free(exts);
-    node_free(meta_node);
-
+    node_free(meta_node); node_free(mirror_node);
+    free(m->ext.lbn); free(m->ext.nb);
+    m->ext.lbn = xmalloc2(sizeof(uint32_t)); m->ext.nb = xmalloc2(sizeof(uint32_t));
+    m->ext.lbn[0] = (uint32_t)primary; m->ext.nb[0] = new_blocks;
+    m->ext.count = m->ext.cap = 1; m->blocks = blocks;
     if (has_mirror) {
-        Node *mirror_node = udf_load(u, pref, m->mirror, "metadata-mirror");
-        uint64_t mirror_phys_lbn = (old_N + add_blocks) - u->pd_start[0];
-        size_t ec2 = m->mirror_ext.count + 1;
-        Extent *exts2 = xmalloc2(ec2*sizeof(Extent));
-        size_t ei2=0;
-        for (size_t k=0;k<m->mirror_ext.count;k++) { exts2[ei2].ref=pref; exts2[ei2].lbn=m->mirror_ext.lbn[k]; exts2[ei2].len=(uint64_t)m->mirror_ext.nb[k]*BS; ei2++; }
-        exts2[ei2].ref=pref; exts2[ei2].lbn=(uint32_t)mirror_phys_lbn; exts2[ei2].len=add_blocks*BS; ei2++;
-        uint64_t total2=0; for(size_t k=0;k<ei2;k++) total2+=exts2[k].len;
-        udf_rewrite_file(u, mirror_node, exts2, ei2, total2, mirror_node->alloc, 0, rep);
-        free(m->mirror_ext.lbn); free(m->mirror_ext.nb); m->mirror_ext.lbn=NULL; m->mirror_ext.nb=NULL; m->mirror_ext.count=0; m->mirror_ext.cap=0;
-        for (size_t k=0;k<ei2;k++) {
-            if (m->mirror_ext.count==m->mirror_ext.cap) { m->mirror_ext.cap=m->mirror_ext.cap?m->mirror_ext.cap*2:16; m->mirror_ext.lbn=xrealloc2(m->mirror_ext.lbn,m->mirror_ext.cap*sizeof(uint32_t)); m->mirror_ext.nb=xrealloc2(m->mirror_ext.nb,m->mirror_ext.cap*sizeof(uint32_t)); }
-            m->mirror_ext.lbn[m->mirror_ext.count]=exts2[k].lbn;
-            m->mirror_ext.nb[m->mirror_ext.count]=(uint32_t)(exts2[k].len/BS);
-            m->mirror_ext.count++;
-        }
-        free(exts2);
-        node_free(mirror_node);
+        free(m->mirror_ext.lbn); free(m->mirror_ext.nb);
+        m->mirror_ext.lbn = xmalloc2(sizeof(uint32_t)); m->mirror_ext.nb = xmalloc2(sizeof(uint32_t));
+        m->mirror_ext.lbn[0] = (uint32_t)mirror; m->mirror_ext.nb[0] = new_blocks;
+        m->mirror_ext.count = m->mirror_ext.cap = 1;
     }
-
-    /* AVDP */
-    uint64_t old_avdp_sec = old_N - 1;
-    unsigned char *old_avdp = image_sector(u->img, old_avdp_sec);
-    if (tag_id(old_avdp)==2) {
-        unsigned char *new_avdp = xmalloc2(BS); memcpy(new_avdp, old_avdp, BS);
-        uint64_t new_avdp_sec = new_N - 1;
-        new_avdp[12]=(unsigned char)(new_avdp_sec & 0xFF);
-        new_avdp[13]=(unsigned char)((new_avdp_sec>>8)&0xFF);
-        new_avdp[14]=(unsigned char)((new_avdp_sec>>16)&0xFF);
-        new_avdp[15]=(unsigned char)((new_avdp_sec>>24)&0xFF);
-        uint16_t crclen = u16(new_avdp,10);
-        if (crclen) seal(new_avdp, crclen);
-        image_put(u->img, new_avdp_sec, new_avdp);
-        free(new_avdp);
+    image_grow(u->img, new_n * BS);
+    for (int i=0; i<2; i++) {
+        uint32_t loc = (uint32_t)(i ? new_n-1 : new_n-257);
+        memcpy(anchor+12, &loc, 4);
+        seal(anchor, u16(anchor,10));
+        image_put(u->img, loc, anchor);
     }
-    free(old_avdp);
-
-    uint64_t old_res_avdp_sec = (old_N >= 257) ? old_N - 257 : 0;
-    unsigned char *old_res = image_sector(u->img, old_res_avdp_sec);
-    if (tag_id(old_res)==2) {
-        unsigned char *new_res = xmalloc2(BS); memcpy(new_res, old_res, BS);
-        uint64_t new_res_sec = new_N - 257;
-        new_res[12]=(unsigned char)(new_res_sec & 0xFF);
-        new_res[13]=(unsigned char)((new_res_sec>>8)&0xFF);
-        new_res[14]=(unsigned char)((new_res_sec>>16)&0xFF);
-        new_res[15]=(unsigned char)((new_res_sec>>24)&0xFF);
-        uint16_t crclen = u16(new_res,10);
-        if (crclen) seal(new_res, crclen);
-        image_put(u->img, new_res_sec, new_res);
-        free(new_res);
-    }
-    free(old_res);
-
-    report_say(rep, "  * [ISO Grow] Expanded ISO by %llu sectors (%llu KiB) to provide %llu metadata blocks.",
-               (unsigned long long)total_add, (unsigned long long)(total_add*BS/1024),
-               (unsigned long long)add_blocks);
+    free(anchor);
+    report_say(rep, "  * [ISO Grow] Relocated metadata into contiguous extents and added %llu blocks.",
+               (unsigned long long)add);
 }
 
 uint32_t *udf_alloc_blocks(Udf *u, int ref, size_t count, size_t *out_count, Report *rep) {
@@ -292,4 +451,21 @@ int udf_rewrite_file(Udf *u, Node *n, Extent *exts, size_t ext_count, uint64_t l
     udf_put_block(u, n->ref, n->lbn, buf);
     free(buf); free(fe_ads); free(dat); free(blocks);
     return (int)n_aed;
+}
+
+int udf_set_file_type(Udf *u, Node *n, uint8_t file_type) {
+    if (n->ftype == file_type) return 0;
+    uint16_t crc_len = u16(n->buf, 10);
+    if (crc_len > BS - 16)
+        udf_error("%s: Invalid descriptor CRC length %u.", n->name, crc_len);
+
+    unsigned char *buf = xmalloc2(BS);
+    memcpy(buf, n->buf, BS);
+    buf[27] = file_type;
+    seal(buf, crc_len);
+    udf_put_block(u, n->ref, n->lbn, buf);
+    memcpy(n->buf, buf, BS);
+    n->ftype = file_type;
+    free(buf);
+    return 1;
 }
